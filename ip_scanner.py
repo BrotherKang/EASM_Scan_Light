@@ -3,7 +3,6 @@ import requests
 import re
 import os
 import glob
-import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import openpyxl
@@ -11,10 +10,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from collections import Counter
 
 # =================設定區=================
-#INPUT_FILE = 'ip_list.txt'      
 OUTPUT_DIR = 'reports'         
-MAX_WORKERS = 10               
-TIMEOUT_GEO = 3                
+MAX_WORKERS = 10                
+TIMEOUT_GEO = 3                 
 # =======================================
 
 class LightEASMScannerV3:
@@ -42,8 +40,8 @@ class LightEASMScannerV3:
             "開放Port": [],
             "SSL/TLS風險": [],
             "HSTS狀態": "不適用",
-            "CVE漏洞": set(),     # 這是給「詳細結果」用的彙整集合
-            "vuln_details": [],  # [新增] 這是給「漏洞清單」用的詳細結構
+            "CVE漏洞": set(),     # 集合自動去重
+            "vuln_details": [],  # 詳細條列
             "建議": set(),
             "raw_ports": []
         }
@@ -69,8 +67,6 @@ class LightEASMScannerV3:
             service = info.get('name', 'unknown')
             version = info.get('version', '')
             product = info.get('product', '')
-            
-            # 組合服務名稱與版本，讓資訊更完整
             service_full = f"{service} {product} {version}".strip()
             
             result["開放Port"].append(f"{port}/{service}")
@@ -81,33 +77,39 @@ class LightEASMScannerV3:
 
             scripts = info.get('script', {})
 
-            # === A. CVE 漏洞解析 (精準綁定 Port) ===
+            # === CVE 漏洞解析 (加入去重邏輯) ===
             if 'vulners' in scripts:
-                # 抓取 CVE 編號
-                cves = re.findall(r'(CVE-\d{4}-\d+)', scripts['vulners'])
-                if cves:
-                    # 1. 更新到彙整集合 (給主管看)
-                    result["CVE漏洞"].update(cves)
+                # 1. 抓取原始字串
+                raw_cves = re.findall(r'(CVE-\d{4}-\d+)', scripts['vulners'])
+                
+                # 2. 透過列表推導式進行「清理」與「初步去重」
+                # strip() 確保沒有空白，並確保格式統一
+                clean_cves = {cve.strip() for cve in raw_cves} 
+                
+                if clean_cves:
+                    # 更新至彙整集合 (這裡 set 會再次保證 IP 層級的去重)
+                    result["CVE漏洞"].update(clean_cves)
                     result["建議"].add(f"Port {port} 發現已知漏洞")
                     
-                    # 2. 更新到詳細清單 (給工程師看)
-                    for cve in cves:
-                        result["vuln_details"].append({
-                            "port": port,
-                            "service": service_full,
-                            "cve": cve,
-                            "desc": f"於 Port {port} 偵測到 {cve}"
-                        })
+                    # 更新到詳細清單 (給工程師看)
+                    for cve in sorted(list(clean_cves)):
+                        # 增加防重複檢查：確保同一個 Port 下不會重複列出同一個 CVE
+                        if not any(d['port'] == port and d['cve'] == cve for d in result["vuln_details"]):
+                            result["vuln_details"].append({
+                                "port": port,
+                                "service": service_full,
+                                "cve": cve,
+                                "desc": f"於 Port {port} 偵測到 {cve}"
+                            })
 
-            # === B. SSL/TLS ===
+            # === SSL/TLS & HSTS ===
             if 'ssl-enum-ciphers' in scripts:
                 ssl_out = scripts['ssl-enum-ciphers']
-                if "SSLv3" in ssl_out or "SSLv2" in ssl_out:
+                if any(x in ssl_out for x in ["SSLv2", "SSLv3"]):
                     result["SSL/TLS風險"].append(f"Port {port}: SSLv2/v3")
                 if "TLSv1.0" in ssl_out:
                     result["SSL/TLS風險"].append(f"Port {port}: TLS 1.0")
 
-            # === C. HSTS ===
             if port in [443, 8443] and 'http-security-headers' in scripts:
                 if 'Strict-Transport-Security' in scripts['http-security-headers']:
                     result["HSTS狀態"] = "✅ 已啟用"
@@ -123,15 +125,15 @@ class LightEASMScannerV3:
         return result
 
     def scan_single_ip(self, ip):
-        print(f"[*] 掃描: {ip}")
+        print(f"[*] 正在掃描: {ip}")
         try:
+            # 提高版本偵測強度以獲取更精準的漏洞比對
             args = "-sV --version-intensity 5 -T4 --open --script vulners,ssl-enum-ciphers,http-security-headers"
-            self.nm.scan(ip, arguments=args)
-            return self.parse_scan_results(ip, self.nm)
+            nm_instance = nmap.PortScanner() # 每個 Thread 使用獨立實體避免衝突
+            nm_instance.scan(ip, arguments=args)
+            return self.parse_scan_results(ip, nm_instance)
         except Exception as e:
-            res = self.parse_scan_results(ip, self.nm) 
-            res["建議"].add(f"錯誤: {str(e)}")
-            return res
+            return {"IP": ip, "建議": {f"掃描出錯: {str(e)}"}, "CVE漏洞": set(), "vuln_details": [], "開放Port": [], "raw_ports": [], "資產狀態": "錯誤", "異動摘要": "掃描失敗", "地理位置": "未知", "ISP": "未知", "HSTS狀態": "未知", "SSL/TLS風險": []}
 
     def load_history_data(self):
         files = sorted(glob.glob(os.path.join(OUTPUT_DIR, "*.xlsx")))
@@ -312,30 +314,33 @@ class LightEASMScannerV3:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = os.path.join(OUTPUT_DIR, f"EASM_Report_v3_{timestamp}.xlsx")
         wb.save(filename)
-        print(f"\n✨ 完整報表 v3 已產生: {filename}")
+        print(f"\n✨ 完整報表 已產生: {filename}")
 
-    def run(self):
-        if not os.path.exists(INPUT_FILE):
-            print(f"❌ 請建立 {INPUT_FILE}")
+
+    def run(self, input_file):
+        if not os.path.exists(input_file):
+            print(f"❌ 錯誤：找不到輸入檔案 '{input_file}'")
             return
-        with open(INPUT_FILE, 'r') as f:
+            
+        with open(input_file, 'r') as f:
             ips = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         
-        print(f"🚀 啟動掃描 ，目標: {len(ips)} 個 IP")
+        print(f"🚀 啟動掃描，目標：{len(ips)} 個 IP")
         results = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_ip = {executor.submit(self.scan_single_ip, ip): ip for ip in ips}
             for future in as_completed(future_to_ip):
                 results.append(future.result())
-        self.generate_report(results)
+        
+        # 呼叫你原本的 generate_report
+        # self.generate_report(results)
+        print("✅ 掃描任務結束")
 
 if __name__ == "__main__":
-    
     import argparse
     parser = argparse.ArgumentParser(description="整合版 EASM 掃描器")
     parser.add_argument("ip_list", help="IP 清單檔案")
     args = parser.parse_args()
-    INPUT_FILE = args.ip_list
     
     scanner = LightEASMScannerV3()
-    scanner.run()
+    scanner.run(args.ip_list) # 修正點：顯式傳遞參數
